@@ -1,4 +1,4 @@
-# VantaStalker 🕵️‍♂️
+# VantaStalker 
 
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
 ![Docker](https://img.shields.io/badge/docker-ready-blue)
