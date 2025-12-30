@@ -1,3 +1,5 @@
+import base64
+import hashlib
 import subprocess
 import os
 from typing import Dict, Any
@@ -10,7 +12,8 @@ def get_screenshot_sync(domain: str) -> Dict[str, Any]:
     url = f"https://{domain}"
     results = {
         "screenshot_base64": None,
-        "success": False
+        "success": False,
+        "hash": None
     }
     
     script_path = os.path.join(os.path.dirname(__file__), "../screenshot_service/screenshot.js")
@@ -29,6 +32,11 @@ def get_screenshot_sync(domain: str) -> Dict[str, Any]:
             if len(base64_data) > 100: # Basic validation
                 results["screenshot_base64"] = base64_data
                 results["success"] = True
+                try:
+                    raw = base64.b64decode(base64_data.encode("utf-8"))
+                    results["hash"] = hashlib.sha256(raw).hexdigest()
+                except Exception:
+                    results["hash"] = None
             else:
                 results["error"] = "Output too short or invalid"
         else:

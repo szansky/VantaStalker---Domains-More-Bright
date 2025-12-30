@@ -36,6 +36,12 @@ from services.waf_tool import detect_waf
 from services.fuzzer_tool import fuzz_directories
 from services.crawler_tool import crawl_site
 from services.cors_tool import check_cors
+from services.history_tool import compare_snapshots, compare_with_latest, list_snapshots, load_snapshot, save_snapshot
+from services.case_tool import assign_scan, create_case, get_case, list_cases, update_case
+from services.normalize_tool import normalize_snapshot
+from services.target_guard import guard_target
+from services.job_queue import get_job, submit_job
+from services.scan_job import run_scan_job
 
 app = FastAPI()
 
@@ -61,6 +67,11 @@ def validate_target(target: str) -> bool:
     return bool(DOMAIN_PATTERN.match(target) or IP_PATTERN.match(target))
 
 from fastapi import HTTPException
+from fastapi.responses import FileResponse
+from typing import Optional
+import json
+import os
+import zipfile
 
 @app.get("/health")
 def health():
@@ -68,16 +79,7 @@ def health():
 
 @app.post("/lookup")
 def lookup(req: LookupRequest):
-    target = req.target.strip()
-    
-    # 0. Sanitization
-    if "://" in target:
-        try:
-            from urllib.parse import urlparse
-            target = urlparse(target).netloc.split(":")[0]
-        except:
-            pass
-    if "/" in target: target = target.split("/")[0]
+    target = sanitize_target(req.target)
 
     # 1. Determine Type
     is_ip = False
@@ -147,6 +149,8 @@ def lookup(req: LookupRequest):
         # 4. Calculate Risk Score (Aggregated)
         result["risk_score"] = calculate_risk_score(result)
 
+    return result
+
 def sanitize_target(target: str) -> str:
     """Sanitizes and validates the target. Raises HTTPException if invalid."""
     target = target.strip()
@@ -170,6 +174,11 @@ def sanitize_target(target: str) -> str:
     # Validate
     if not validate_target(target):
         raise HTTPException(status_code=400, detail=f"Invalid domain or IP: {target}")
+
+    try:
+        guard_target(target)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     
     return target
 
@@ -330,12 +339,181 @@ def comments_endpoint(req: LookupRequest):
 def trace_endpoint(req: LookupRequest):
     return trigger_trace(req.target)
 
-# Keep monolithic for legacy or quick checks if needed
-@app.post("/lookup")
-def lookup(req: LookupRequest):
-    # ... existing implementation ...
-    target = req.target.strip()
-    # ... (rest of function kept as is for backward compat if needed, or simply return the aggregate)
-    # Re-implementing using the new functions to ensure consistency is best, but for now I will append the new endpoints validly.
-    pass 
+class HistoryGetRequest(BaseModel):
+    target: str
+    timestamp: str
 
+
+class HistorySaveRequest(BaseModel):
+    target: str
+    snapshot: dict
+    case_id: Optional[str] = None
+
+
+class HistoryCompareRequest(BaseModel):
+    target: str
+    a: str
+    b: str
+
+
+@app.post("/api/history/list")
+def history_list_endpoint(req: LookupRequest):
+    target = sanitize_target(req.target)
+    return {"target": target, "items": list_snapshots(target)}
+
+
+@app.post("/api/history/get")
+def history_get_endpoint(req: HistoryGetRequest):
+    target = sanitize_target(req.target)
+    snapshot = load_snapshot(target, req.timestamp)
+    if snapshot is None:
+        raise HTTPException(status_code=404, detail="Snapshot not found")
+    return {"target": target, "timestamp": req.timestamp, "snapshot": snapshot}
+
+
+@app.post("/api/history/compare")
+def history_compare_endpoint(req: HistoryCompareRequest):
+    target = sanitize_target(req.target)
+    a = load_snapshot(target, req.a)
+    b = load_snapshot(target, req.b)
+    if a is None or b is None:
+        raise HTTPException(status_code=404, detail="Snapshot not found")
+    return {"target": target, "a": req.a, "b": req.b, "diff": compare_snapshots(a, b)}
+
+
+@app.post("/api/history/save")
+def history_save_endpoint(req: HistorySaveRequest):
+    target = sanitize_target(req.target)
+    req.snapshot["target"] = target
+    normalized = normalize_snapshot(req.snapshot)
+    req.snapshot["normalized"] = normalized
+    diff = compare_with_latest(target, req.snapshot)
+    saved = save_snapshot(target, req.snapshot)
+    if req.case_id:
+        assign_scan(req.case_id, target, saved["timestamp"])
+    return {"target": target, "saved": saved, "diff": diff, "normalized": normalized}
+
+
+@app.post("/api/normalize")
+def normalize_endpoint(req: HistorySaveRequest):
+    target = sanitize_target(req.target)
+    req.snapshot["target"] = target
+    normalized = normalize_snapshot(req.snapshot)
+    return {"target": target, "normalized": normalized}
+
+
+class CaseCreateRequest(BaseModel):
+    name: str
+    description: str = ""
+    status: str = "new"
+    tags: list = []
+
+
+class CaseUpdateRequest(BaseModel):
+    id: str
+    name: Optional[str] = None
+    description: Optional[str] = None
+    status: Optional[str] = None
+    tags: Optional[list] = None
+
+
+class CaseAssignRequest(BaseModel):
+    id: str
+    target: str
+    timestamp: str
+
+
+@app.get("/api/cases")
+def cases_list_endpoint():
+    return {"cases": list_cases()}
+
+
+@app.post("/api/cases/create")
+def cases_create_endpoint(req: CaseCreateRequest):
+    case = create_case(req.name, req.description, req.status, req.tags)
+    return {"case": case}
+
+
+@app.post("/api/cases/update")
+def cases_update_endpoint(req: CaseUpdateRequest):
+    payload = {k: v for k, v in req.model_dump().items() if v is not None and k != "id"}
+    case = update_case(req.id, payload)
+    if case is None:
+        raise HTTPException(status_code=404, detail="Case not found")
+    return {"case": case}
+
+
+@app.post("/api/cases/assign")
+def cases_assign_endpoint(req: CaseAssignRequest):
+    target = sanitize_target(req.target)
+    case = assign_scan(req.id, target, req.timestamp)
+    if case is None:
+        raise HTTPException(status_code=404, detail="Case not found")
+    return {"case": case}
+
+
+@app.get("/api/cases/export/{case_id}")
+def cases_export_endpoint(case_id: str):
+    case = get_case(case_id)
+    if not case:
+        raise HTTPException(status_code=404, detail="Case not found")
+
+    export_dir = os.path.join(os.path.dirname(__file__), "data", "exports")
+    os.makedirs(export_dir, exist_ok=True)
+    zip_path = os.path.join(export_dir, f"{case_id}.zip")
+
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for scan in case.get("scans", []):
+            domain = scan.get("domain")
+            timestamp = scan.get("timestamp")
+            if not domain or not timestamp:
+                continue
+            snapshot = load_snapshot(domain, timestamp)
+            if snapshot is None:
+                continue
+            filename = f"{domain}/{timestamp}.json"
+            zf.writestr(filename, json.dumps(snapshot, indent=2, sort_keys=True))
+
+    name = case.get("name") or "case"
+    safe_name = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in name)
+    return FileResponse(zip_path, filename=f"{safe_name}.zip")
+
+
+class ScanStartRequest(BaseModel):
+    target: str
+    case_id: Optional[str] = None
+
+
+@app.post("/api/scan/start")
+def scan_start_endpoint(req: ScanStartRequest):
+    target = sanitize_target(req.target)
+    job_id = submit_job(
+        run_scan_job,
+        target,
+        case_id=req.case_id,
+        payload={"target": target, "case_id": req.case_id},
+    )
+    return {"job_id": job_id, "target": target}
+
+
+@app.get("/api/scan/status/{job_id}")
+def scan_status_endpoint(job_id: str):
+    job = get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return {
+        "id": job["id"],
+        "status": job["status"],
+        "created_at": job["created_at"],
+        "updated_at": job["updated_at"],
+        "payload": job.get("payload"),
+        "progress": job.get("progress", {}),
+        "tools": job.get("tools", {}),
+        "snapshot": job.get("snapshot"),
+        "normalized": job.get("normalized"),
+        "diff": job.get("diff"),
+        "saved": job.get("saved"),
+        "alerts": job.get("alerts"),
+        "cached": job.get("cached", False),
+        "error": job.get("error"),
+    }
